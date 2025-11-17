@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NUESA Receipt Generator</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Load Heroicons for icons -->
+    <script type_module src="https://unpkg.com/heroicons/dist/outline.min.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom styles for the receipt preview */
+        .receipt-preview {
+            max-width: 48rem; /* 768px */
+            margin: 2rem auto;
+            border: 1px solid #e5e7eb; /* gray-200 */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            border-radius: 0.5rem; /* rounded-lg */
+        }
+        /* Styles for printing */
+        @media print {
+            body * {
+                visibility: hidden;
+            }
+            #receiptPreviewContainer, #receiptPreviewContainer * {
+                visibility: visible;
+            }
+            #receiptPreviewContainer {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                margin: 0;
+                border: none;
+                box-shadow: none;
+                border-radius: 0;
+            }
+            #printButton {
+                display: none;
+            }
+        }
+        /* Custom message box */
+        #messageBox {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            transition: all 0.3s ease-in-out;
+            opacity: 0;
+            transform: translateY(20px);
+            z-index: 50;
+        }
+        #messageBox.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 h-screen flex flex-col items-center justify-center p-4">
+
+    <!-- Firebase SDK Scripts (Kept for future use, but UI is hidden) -->
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, inMemoryPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, collection, onSnapshot, query, deleteDoc, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables ---
+        let db, auth;
+        let userId = null;
+        let appId = 'default-app-id';
+        let currentReceiptItems = [];
+        let unsubscribeReceipts = null; // To store the onSnapshot unsubscribe function
+
+        // --- DOM Elements ---
+        const authStatus = document.getElementById('authStatus');
+        const userIdDisplay = document.getElementById('userIdDisplay');
+        const showFormButton = document.getElementById('showFormButton');
+        const receiptFormContainer = document.getElementById('receiptFormContainer');
+        const receiptForm = document.getElementById('receiptForm');
+        const receiptList = document.getElementById('receiptList');
+        const receiptPreview = document.getElementById('receiptPreview');
+        const receiptPreviewContainer = document.getElementById('receiptPreviewContainer');
+        const addItemButton = document.getElementById('addItemButton');
+        const itemsContainer = document.getElementById('itemsContainer');
+        const totalAmountDisplay = document.getElementById('totalAmountDisplay');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const printButton = document.getElementById('printButton');
+        const messageBox = document.getElementById('messageBox');
+        const messageText = document.getElementById('messageText');
+        const messageClose = document.getElementById('messageClose');
+
+        // --- Helper Functions ---
+
+        /**
+         * Shows a message to the user
+         * @param {string} message - The text to display
+         * @param {boolean} isError - If true, styles as an error
+         */
+        function showMessage(message, isError = false) {
+            messageText.textContent = message;
+            messageBox.classList.remove('bg-red-500', 'bg-green-500');
+            if (isError) {
+                messageBox.classList.add('bg-red-500');
+            } else {
+                messageBox.classList.add('bg-green-500');
+            }
+            messageBox.classList.add('show');
+            
+            setTimeout(() => {
+                messageBox.classList.remove('show');
+            }, 3000);
+        }
+
+        messageClose.addEventListener('click', () => {
+            messageBox.classList.remove('show');
+        });
+
+        /**
+         * Toggles the loading indicator
+         * @param {boolean} show - Whether to show or hide the loader
+         */
+        function showLoading(show) {
+            loadingIndicator.classList.toggle('hidden', !show);
+        }
+
+        /**
+         * Formats a number as currency (USD)
+         * @param {number} amount - The amount to format
+         * @returns {string} - Formatted currency string
+         */
+        function formatCurrency(amount) {
+            return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
+        }
+
+        /**
+         * Updates the total amount in the form
+         */
+        function updateFormTotal() {
+            const total = currentReceiptItems.reduce((sum, item) => sum + (item.quantity * item.price), 0);
+            totalAmountDisplay.textContent = formatCurrency(total);
+        }
+
+        /**
+         * Adds a new item row to the form
+         */
+        function addNewItemRow() {
+            const itemId = crypto.randomUUID();
+            const item = { id: itemId, description: '', quantity: 1, price: 0 };
+            currentReceiptItems.push(item);
+
+            const itemEl = document.createElement('div');
+            itemEl.className = 'flex space-x-2 items-end';
+            itemEl.setAttribute('data-item-id', itemId);
+            itemEl.innerHTML = `
+                <div class="flex-grow">
+                    <label class="text-xs text-gray-500">Description</label>
+                    <input type="text" class="item-desc w-full px-3 py-2 border border-gray-300 rounded-md" required>
+                </div>
+                <div class="w-20">
+                    <label class="text-xs text-gray-500">Qty</label>
+                    <input type="number" class="item-qty w-full px-3 py-2 border border-gray-300 rounded-md" value="1" min="1" required>
+                </div>
+                <div class="w-24">
+                    <label class="text-xs text-gray-500">Price</label>
+                    <input type="number" class="item-price w-full px-3 py-2 border border-gray-300 rounded-md" value="0" min="0" step="0.01" required>
+                </div>
+                <button type="button" class="remove-item-btn bg-red-500 text-white p-2 rounded-md hover:bg-red-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                </button>
+            `;
+
+            itemsContainer.appendChild(itemEl);
+
+            // Add event listeners for new inputs
+            itemEl.querySelector('.item-desc').addEventListener('input', (e) => {
+                item.description = e.target.value;
+            });
+            itemEl.querySelector('.item-qty').addEventListener('input', (e) => {
+                item.quantity = parseFloat(e.target.value) || 0;
+                updateFormTotal();
+            });
+            itemEl.querySelector('.item-price').addEventListener('input', (e) => {
+                item.price = parseFloat(e.target.value) || 0;
+                updateFormTotal();
+            });
+            itemEl.querySelector('.remove-item-btn').addEventListener('click', () => {
+                currentReceiptItems = currentReceiptItems.filter(i => i.id !== itemId);
+                itemsContainer.removeChild(itemEl);
+                updateFormTotal();
+            });
+        }
+
+        /**
+         * Clears and resets the new receipt form
+         */
+        function resetForm() {
+            receiptForm.reset();
+            itemsContainer.innerHTML = '';
+            currentReceiptItems = [];
+            addNewItemRow();
+            updateFormTotal();
+        }
+
+        /**
+         * Renders the list of receipts
+         * @param {Array} receipts - Array of receipt documents
+         */
+        function renderReceiptList(receipts) {
+            receiptList.innerHTML = '';
+            if (receipts.length === 0) {
+                receiptList.innerHTML = `<li class="text-gray-500 text-center p-4">No receipts found.</li>`;
+                return;
+            }
+
+            // Sort receipts by date, newest first
+            const sortedReceipts = receipts.sort((a, b) => b.data.date.localeCompare(a.data.date));
+
+            sortedReceipts.forEach(receipt => {
+                const data = receipt.data;
+                const total = data.items.reduce((sum, item) => sum + (item.quantity * item.price), 0);
+                
+                const li = document.createElement('li');
+                li.className = 'bg-white p-4 rounded-lg shadow hover:shadow-md transition-shadow cursor-pointer';
+                li.setAttribute('data-id', receipt.id);
+                li.innerHTML = `
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <p class="font-semibold text-blue-600">${data.recipientName}</p>
+                            <p class="text-sm text-gray-500">${new Date(data.date).toLocaleDateString()}</p>
+                        </div>
+                        <div class="text-right">
+                            <p class="font-bold text-lg text-gray-800">${formatCurrency(total)}</p>
+                        </div>
+                    </div>
+                `;
+                // View receipt on click
+                li.addEventListener('click', () => viewReceipt(receipt.id));
+                receiptList.appendChild(li);
+            });
+        }
+
+        /**
+         * Generates and displays the HTML for a receipt preview
+         * @param {object} receiptData - The data for the receipt
+         */
+        function displayReceiptPreview(receiptData) {
+            const total = receiptData.items.reduce((sum, item) => sum + (item.quantity * item.price), 0);
+            
+            receiptPreview.innerHTML = `
+                <div class="p-8 md:p-12">
+                    <div class="flex justify-between items-start mb-8">
+                        <div>
+                            <h1 class="text-3xl font-bold text-gray-900">Receipt</h1>
+                            <p class="text-gray-500">Receipt ID: <span class="font-medium text-gray-700">${receiptData.id || 'N/A'}</span></p>
+                        </div>
+                        <div class="text-right">
+                            <p class="text-lg font-semibold text-gray-800">Company Inc.</p>
+                            <p class="text-gray-500">123 Business Rd.<br>City, State 12345</p>
+                        </div>
+                    </div>
+
+                    <div class="border-b border-gray-200 pb-8 mb-8">
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <h2 class="text-sm font-semibold text-gray-500 uppercase mb-2">BILLED TO</h2>
+                                <p class="font-medium text-gray-800">${receiptData.recipientName}</p>
+                                <p class="text-gray-600">${receiptData.recipientEmail}</p>
+                            </div>
+                            <div class="text-right">
+                                <h2 class="text-sm font-semibold text-gray-500 uppercase mb-2">RECEIPT DATE</h2>
+                                <p class="font-medium text-gray-800">${new Date(receiptData.date).toLocaleDateString()}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <table class="w-full mb-8">
+                        <thead>
+                            <tr class="border-b border-gray-300">
+                                <th class="text-left text-sm font-semibold text-gray-500 uppercase p-2">Description</th>
+                                <th class="text-right text-sm font-semibold text-gray-500 uppercase p-2">Qty</th>
+                                <th class="text-right text-sm font-semibold text-gray-500 uppercase p-2">Unit Price</th>
+                                <th class="text-right text-sm font-semibold text-gray-500 uppercase p-2">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${receiptData.items.map(item => `
+                                <tr class="border-b border-gray-200">
+                                    <td class="text-left p-2">${item.description}</td>
+                                    <td class="text-right p-2">${item.quantity}</td>
+                                    <td class="text-right p-2">${formatCurrency(item.price)}</td>
+                                    <td class="text-right p-2">${formatCurrency(item.quantity * item.price)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+
+                    <div class="flex justify-end">
+                        <div class="w-full md:w-1/3">
+                            <div class="flex justify-between py-2">
+                                <span class="text-gray-600">Subtotal</span>
+                                <span class="font-medium text-gray-800">${formatCurrency(total)}</span>
+                            </div>
+                            <div class="flex justify-between py-2">
+                                <span class="text-gray-600">Tax (0%)</span>
+                                <span class="font-medium text-gray-800">${formatCurrency(0)}</span>
+                            </div>
+                            <div classs="flex justify-between py-2 border-t-2 border-gray-300 mt-2">
+                                <span class="text-xl font-bold text-gray-900">Total</span>
+                                <span class="text-xl font-bold text-gray-900">${formatCurrency(total)}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mt-12 text-center text-gray-500 text-sm">
+                        <p>Thank you for your business!</p>
+                    </div>
+                </div>
+            `;
+            receiptPreviewContainer.classList.remove('hidden');
+            printButton.classList.remove('hidden');
+        }
+
+        // --- Firebase Functions ---
+
+        /**
+         * Initializes Firebase and handles authentication
+         */
+        async function initFirebase() {
+            try {
+                showLoading(true);
+                // Use global __firebase_config and __app_id if available
+                const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+                const firebaseConfig = JSON.parse(firebaseConfigStr);
+                
+                // Fallback config for local testing if global config is empty
+                if (!firebaseConfig.apiKey) {
+                    console.warn("Using fallback Firebase config. This is for local testing ONLY.");
+                    // NOTE: This is a placeholder and won't work without a real config
+                    // Replace with your own test config if needed
+                    // firebaseConfig = { apiKey: "...", authDomain: "...", projectId: "...", ... };
+                }
+
+                if (typeof __app_id !== 'undefined') {
+                    appId = __app_id;
+                }
+                
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('debug'); // Enable Firestore logging
+
+                // Use in-memory persistence
+                await setPersistence(auth, inMemoryPersistence);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        // User is signed in
+                        userId = user.uid;
+                        authStatus.textContent = 'Authenticated';
+                        authStatus.classList.remove('bg-yellow-500');
+                        authStatus.classList.add('bg-green-500');
+                        userIdDisplay.textContent = `User ID: ${userId}`;
+                        
+                        // Load user's receipts
+                        loadReceipts(userId);
+                    } else {
+                        // User is signed out
+                        userId = null;
+                        authStatus.textContent = 'Authenticating...';
+                        authStatus.classList.add('bg-yellow-500');
+                        authStatus.classList.remove('bg-green-500');
+                        userIdDisplay.textContent = 'User ID: N/A';
+                        
+                        // Clean up old listener if exists
+                        if (unsubscribeReceipts) {
+                            unsubscribeReceipts();
+                            unsubscribeReceipts = null;
+                        }
+                        receiptList.innerHTML = '<li class="text-gray-500 text-center p-4">Please wait, authenticating...</li>';
+
+                        // Try to sign in
+                        try {
+                            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                            } else {
+                                console.warn("No __initial_auth_token. Signing in anonymously.");
+                                await signInAnonymously(auth);
+                            }
+                        } catch (error) {
+                            console.error("Authentication Error:", error);
+                            authStatus.textContent = 'Auth Failed';
+                            authStatus.classList.add('bg-red-500');
+                            userIdDisplay.textContent = `Error: ${error.message}`;
+                            showMessage("Failed to authenticate.", true);
+                        }
+                    }
+                    showLoading(false);
+                });
+
+            } catch (error) {
+                console.error("Firebase Init Error:", error);
+                showMessage("Error initializing application.", true);
+                showLoading(false);
+                authStatus.textContent = 'Init Failed';
+                authStatus.classList.add('bg-red-500');
+            }
+        }
+
+        /**
+         * Loads and listens for real-time updates on receipts
+         * @param {string} uid - The user's ID
+         */
+        function loadReceipts(uid) {
+            if (unsubscribeReceipts) {
+                unsubscribeReceipts(); // Unsubscribe from previous listener
+            }
+
+            const receiptsPath = `artifacts/${appId}/users/${uid}/receipts`;
+            const receiptsCol = collection(db, receiptsPath);
+            const q = query(receiptsCol); // Can add orderBy here, but requires index
+
+            unsubscribeReceipts = onSnapshot(q, (snapshot) => {
+                const receipts = [];
+                snapshot.forEach(doc => {
+                    receipts.push({ id: doc.id, data: doc.data() });
+                });
+                renderReceiptList(receipts);
+            }, (error) => {
+                console.error("Error loading receipts:", error);
+                showMessage("Failed to load receipts.", true);
+                receiptList.innerHTML = `<li class="text-red-500 text-center p-4">Error loading receipts.</li>`;
+            });
+        }
+
+        /**
+         * Fetches a single receipt and displays it
+         * @param {string} receiptId - The ID of the receipt to view
+         */
+        async function viewReceipt(receiptId) {
+            if (!userId) {
+                showMessage("You must be authenticated to view receipts.", true);
+                return;
+            }
+            showLoading(true);
+            try {
+                const receiptPath = `artifacts/${appId}/users/${userId}/receipts/${receiptId}`;
+                const docRef = doc(db, receiptPath);
+                const docSnap = await getDoc(docRef);
+
+                if (docSnap.exists()) {
+                    const receiptData = { id: docSnap.id, ...docSnap.data() };
+                    displayReceiptPreview(receiptData);
+                } else {
+                    console.log("No such document!");
+                    showMessage("Receipt not found.", true);
+                }
+            } catch (error) {
+                console.error("Error viewing receipt: ", error);
+                showMessage("Error fetching receipt details.", true);
+            }
+            showLoading(false);
+        }
+
+        /**
+         * Saves a new receipt to Firestore
+         * @param {Event} e - The form submit event
+         */
+        async function saveReceipt(e) {
+            e.preventDefault();
+            if (!userId) {
+                showMessage("You must be authenticated to save receipts.", true);
+                return;
+            }
+
+            showLoading(true);
+
+            const formData = new FormData(receiptForm);
+            const receiptData = {
+                recipientName: formData.get('recipientName'),
+                recipientEmail: formData.get('recipientEmail'),
+                date: formData.get('date'),
+                notes: formData.get('notes'),
+                items: currentReceiptItems.filter(item => item.description) // Only save items with a description
+            };
+
+            // Basic validation
+            if (!receiptData.recipientName || !receiptData.date || receiptData.items.length === 0) {
+                showMessage("Please fill in recipient name, date, and at least one item.", true);
+                showLoading(false);
+                return;
+            }
+            
+            try {
+                const receiptsPath = `artifacts/${appId}/users/${userId}/receipts`;
+                const docRef = await addDoc(collection(db, receiptsPath), receiptData);
+                
+                showMessage("Receipt saved successfully!", false);
+                receiptFormContainer.classList.add('hidden'); // Hide form
+                resetForm();
+                
+                // Display the new receipt
+                viewReceipt(docRef.id);
+
+            } catch (error) {
+                console.error("Error saving receipt: ", error);
+                showMessage("Error saving receipt. " + error.message, true);
+            }
+            showLoading(false);
+        }
+
+
+        // --- Event Listeners ---
+        showFormButton.addEventListener('click', () => {
+            receiptFormContainer.classList.toggle('hidden');
+            resetForm();
+            // Clear preview
+            receiptPreviewContainer.classList.add('hidden');
+            receiptPreview.innerHTML = '';
+            printButton.classList.add('hidden');
+        });
+
+        addItemButton.addEventListener('click', addNewItemRow);
+
+        receiptForm.addEventListener('submit', saveReceipt);
+
+        printButton.addEventListener('click', () => {
+            window.print();
+        });
+
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initFirebase();
+            // We no longer add the initial item row by default
+            // addNewItemRow(); 
+        });
+
+    </script>
+
+    <!-- Sidebar: Form & List (HIDDEN) -->
+    <aside class="w-full md:w-2/5 lg:w-1/3 h-1/2 md:h-full bg-white border-r border-gray-200 flex flex-col hidden">
+        <!-- Header -->
+        <div class="p-4 border-b border-gray-200">
+            <h1 class="text-xl font-bold text-gray-800">NIGERIA UNIVERSITY EDUCATION STUDENTS ASSOCIATION (NUESA)</h1>
+            <div class="mt-2 text-xs">
+                <span id="authStatus" class="px-2 py-1 text-white rounded-full bg-yellow-500 text-xs">Connecting...</span>
+                <span id="userIdDisplay" class="ml-2 text-gray-500">User ID: N/A</span>
+            </div>
+        </div>
+
+        <!-- Create Button -->
+        <div class="p-4 border-b border-gray-200">
+            <button id="showFormButton" class="w-full bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+                Create New Receipt
+            </button>
+        </div>
+
+        <!-- New Receipt Form (hidden by default) -->
+        <div id="receiptFormContainer" class="p-4 overflow-y-auto hidden">
+            <h2 class="text-lg font-semibold mb-4">New Receipt Details</h2>
+            <form id="receiptForm" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label for="recipientName" class="block text-sm font-medium text-gray-700">Recipient Name</label>
+                        <input type="text" id="recipientName" name="recipientName" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" required>
+                    </div>
+                    <div>
+                        <label for="recipientEmail" class="block text-sm font-medium text-gray-700">Recipient Email</label>
+                        <input type="email" id="recipientEmail" name="recipientEmail" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+                    </div>
+                </div>
+                <div>
+                    <label for="date" class="block text-sm font-medium text-gray-700">Date</label>
+                    <input type="date" id="date" name="date" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" required>
+                </div>
+                
+                <!-- Line Items -->
+                <fieldset class="border border-gray-300 p-4 rounded-md">
+                    <legend class="text-sm font-medium text-gray-700 px-2">Items</legend>
+                    <div id="itemsContainer" class="space-y-3">
+                        <!-- Item rows will be injected here by JS -->
+                    </div>
+                    <button type="button" id="addItemButton" class="mt-3 text-sm text-blue-600 hover:text-blue-800 font-medium flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                        </svg>
+                        Add Item
+                    </button>
+                    <div class="mt-4 pt-4 border-t border-gray-200 text-right">
+                        <span class="text-lg font-bold text-gray-800">Total:</span>
+                        <span id="totalAmountDisplay" class="text-lg font-bold text-gray-800 ml-2">$0.00</span>
+                    </div>
+                </fieldset>
+
+                <div>
+                    <label for="notes" class="block text-sm font-medium text-gray-700">Notes</label>
+                    <textarea id="notes" name="notes" rows="3" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm"></textarea>
+                </div>
+
+                <button type="submit" class="w-full bg-green-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-green-700 transition-colors">
+                    Save Receipt
+                </button>
+            </form>
+        </div>
+
+        <!-- Receipt List -->
+        <div class="p-4 border-t border-gray-200 flex-1 overflow-y-auto">
+            <h2 class="text-lg font-semibold text-gray-800 mb-4">Your Receipts</h2>
+            <ul id="receiptList" class="space-y-3">
+                <!-- Receipt items will be injected here by JS -->
+                <li class="text-gray-500 text-center p-4">Loading receipts...</li>
+            </ul>
+        </div>
+    </aside>
+
+    <!-- Main Content: Receipt Preview (HIDDEN) -->
+    <main class="w-full md:w-3/5 lg:w-2/3 h-1/2 md:h-full bg-gray-100 flex flex-col overflow-hidden hidden">
+        <div class="flex-1 overflow-y-auto p-4 md:p-8 relative">
+            
+            <button id="printButton" class="hidden absolute top-4 right-4 bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
+                </svg>
+                Print
+            </button>
+
+            <div id="receiptPreviewContainer" class="hidden">
+                <div id="receiptPreview" class="receipt-preview bg-white">
+                    <!-- Receipt preview will be injected here by JS -->
+                </div>
+            </div>
+            
+            <!-- Placeholder when no receipt is selected -->
+            <div id="previewPlaceholder" class="flex items-center justify-center h-full text-gray-500">
+                <p>Select a receipt from the list or create a new one to see the preview.</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- NEW: Payment Portal UI -->
+    <div class="w-full max-w-2xl">
+        <header class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-gray-800">NUESA</h1>
+            <p class="text-xl font-semibold text-gray-700 mt-1">NIGERIA UNIVERSITY EDUCATION STUDENTS ASSOCIATION</p>
+            <p class="text-lg text-gray-600 mt-2">Payment Portal</p>
+        </header>
+
+        <main class="bg-white p-8 rounded-lg shadow-lg">
+            <h2 class="text-2xl font-semibold text-center mb-6">Select a Payment</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                
+                <!-- Option 1: Dues -->
+                <button id="duesButton" class="flex flex-col items-center justify-center text-center p-6 bg-gray-50 rounded-lg border border-gray-300 hover:bg-blue-50 hover:border-blue-400 hover:shadow-md transition-all cursor-pointer">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-blue-600 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.105 0 2 .895 2 2s-.895 2-2 2-2-.895-2-2 .895-2 2 2zm0 12c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.105 0 2 .895 2 2s-.895 2-2 2-2-.895-2-2 .895-2 2 2z" />
+                    </svg>
+                    <span class="text-xl font-bold text-gray-800">NUESA Dues</span>
+                    <span class="text-gray-600 mt-1">Pay your annual association dues.</span>
+                </button>
+                
+                <!-- Option 2: T-Shirt -->
+                <button id="tshirtButton" class="flex flex-col items-center justify-center text-center p-6 bg-gray-50 rounded-lg border border-gray-300 hover:bg-green-50 hover:border-green-400 hover:shadow-md transition-all cursor-pointer">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-green-600 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l-1.586-1.586a2 2 0 00-2.828 0L6 14m6-6l.207.207a2 2 0 010 2.828L12 11m0-2a2 2 0 00-2 2v.207L6.207 15.207a2 2 0 000 2.828L12 21M18 12a2 2 0 012-2h.207L15.207 6.207a2 2 0 00-2.828 0L12 7m6 5l-2.207 2.207a2 2 0 01-2.828 0L12 13m6 0a2 2 0 002-2V8.207L15.207 3.207a2 2 0 00-2.828 0L12 4" />
+                    </svg>
+                    <span class="text-xl font-bold text-gray-800">NUESA T-Shirt</span>
+                    <span class="text-gray-600 mt-1">Get your official association T-shirt.</span>
+                </button>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- NEW: Dues Info Modal -->
+    <div id="duesInfoModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50 hidden">
+        <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6 relative">
+            <button id="closeDuesInfoModal" class="absolute top-3 right-3 text-gray-400 hover:text-gray-800 text-3xl font-light">&times;</button>
+            <h3 class="text-2xl font-bold mb-5 text-gray-800">NUESA Dues Payment</h3>
+            <p class="text-gray-600 mb-4">Please enter your details before proceeding to payment.</p>
+            <form id="duesInfoForm" class="space-y-4">
+                <div>
+                    <label for="fullName" class="block text-sm font-medium text-gray-700">Full Name</label>
+                    <input type="text" id="fullName" name="fullName" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" required>
+                </div>
+                <div>
+                    <label for="matricNo" class="block text-sm font-medium text-gray-700">Matric No.</label>
+                    <input type="text" id="matricNo" name="matricNo" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" required>
+                </div>
+                <div>
+                    <label for="department" class="block text-sm font-medium text-gray-700">Department</label>
+                    <select id="department" name="department" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm" required>
+                        <option value="" disabled selected>Select your department</option>
+                        <option value="ULSESA">SCIENCE EDUCATION (ULSESA)</option>
+                        <option value="TVESA">TECHNOLOGY AND VOCATIONAL EDUCATION (TVESA)</option>
+                        <option value="HKHE">HUMAN KINETICS AND HEALTH EDUCATION (HKHE)</option>
+                        <option value="SESSA">SOCIAL SCIENCES EDUCATION (SESSA)</option>
+                        <option value="EMSA">EDUCATIONAL MANAGEMENT (EMSA)</option>
+                        <option value="EFSA">EDUCATIONAL FOUNDATION (EFSA)</option>
+                        <option value="AESA">ART EDUCATION (AESA)</option>
+                        <option value="NAAES">ADULT EDUCATION (NAAES)</option>
+                    </select>
+                </div>
+                <button type="submit" class="w-full bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors">
+                    Continue to Payment
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- NEW: Payment Modal -->
+    <div id="paymentModal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-40 hidden">
+        <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6 relative">
+            <button id="closeModal" class="absolute top-3 right-3 text-gray-400 hover:text-gray-800 text-3xl font-light">&times;</button>
+            <h3 id="modalTitle" class="text-2xl font-bold mb-5 text-gray-800">Payment Details</h3>
+            <div class="space-y-4">
+                <p class="text-gray-600">Please make your payment to the following account:</p>
+                <div>
+                    <span class="text-sm font-medium text-gray-500">Bank:</span>
+                    <span id="modalBank" class="text-lg font-semibold text-gray-800 block">Wema Bank</span>
+                </div>
+                <div>
+                    <span class="text-sm font-medium text-gray-500">Account Name:</span>
+                    <span id="modalAccountName" class="text-lg font-semibold text-gray-800 block">NUESA National</span>
+                </div>
+                <div>
+                    <span class="text-sm font-medium text-gray-500">Account Number:</span>
+                    <div class="flex items-center space-x-2 mt-1">
+                        <span id="modalAccountNumber" class="text-2xl font-bold text-blue-600 tracking-wider">1234567890</span>
+                        <button id="copyButton" title="Copy account number" class="p-2 text-gray-500 rounded-md hover:bg-gray-100 hover:text-gray-800 transition">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="mt-4 p-3 bg-yellow-100 border-l-4 border-yellow-400 text-yellow-800 rounded-md">
+                    <p class="font-semibold">Important!</p>
+                    <p id="modalReferenceNote" class="text-sm">Please use your Full Name + Department as payment reference.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Loading Indicator (Unchanged) -->
+    <div id="loadingIndicator" class="hidden fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-50">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-white"></div>
+    </div>
+
+    <!-- Message Box (Unchanged) -->
+    <div id="messageBox" class="p-4 rounded-lg text-white shadow-lg flex items-center max-w-sm">
+        <span id="messageText" class="flex-1"></span>
+        <button id="messageClose" class="ml-4 text-white hover:text-gray-200">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+        </button>
+    </div>
+
+    <!-- NEW: Modal Control Script -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // Get all the new elements
+            const duesButton = document.getElementById('duesButton');
+            const tshirtButton = document.getElementById('tshirtButton');
+
+            // Dues Info Modal Elements
+            const duesInfoModal = document.getElementById('duesInfoModal');
+            const closeDuesInfoModal = document.getElementById('closeDuesInfoModal');
+            const duesInfoForm = document.getElementById('duesInfoForm');
+            const fullNameInput = document.getElementById('fullName');
+            const matricNoInput = document.getElementById('matricNo');
+            const departmentSelect = document.getElementById('department');
+
+            // Payment Modal Elements
+            const paymentModal = document.getElementById('paymentModal');
+            const closeModal = document.getElementById('closeModal');
+            const modalTitle = document.getElementById('modalTitle');
+            const modalBank = document.getElementById('modalBank');
+            const modalAccountName = document.getElementById('modalAccountName');
+            const modalAccountNumber = document.getElementById('modalAccountNumber');
+            const modalReferenceNote = document.getElementById('modalReferenceNote');
+            const copyButton = document.getElementById('copyButton');
+            
+            // --- Re-using the showMessage function from the other script ---
+            // We need a simple version here in case the module one isn't available
+            function showSimpleMessage(message, isError = false) {
+                const msgBox = document.getElementById('messageBox');
+                const msgText = document.getElementById('messageText');
+                if (!msgBox || !msgText) {
+                    console.log("Message:", message);
+                    return; 
+                }
+
+                msgText.textContent = message;
+                msgBox.classList.remove('bg-red-500', 'bg-green-500');
+                if (isError) {
+                    msgBox.classList.add('bg-red-500');
+                } else {
+                    msgBox.classList.add('bg-green-500');
+                }
+                msgBox.classList.add('show');
+                
+                setTimeout(() => {
+                    msgBox.classList.remove('show');
+                }, 3000);
+            }
+            
+            // --- Account Details (Update these with real info) ---
+                const accountDetails = {
+                dues: {
+                    title: "NUESA Dues Payment",
+                    bank: "First Bank",
+                    name: "NUESA National Dues Account",
+                    number: "2001234567",
+                    reference: "Please use the reference generated on the previous screen." // Updated default
+                },
+                tshirt: {
+                    title: "NUESA T-Shirt Payment",
+                    bank: "GTBank (GTCrea8)",
+                    name: "NUESA Social Account",
+                    number: "0012345678",
+                    reference: "Your Full Name + T-Shirt"
+                }
+            };
+
+            // --- Function to open the modal ---
+            function openModal(paymentType, generatedReference = null) {
+                const details = accountDetails[paymentType];
+                
+                modalTitle.textContent = details.title;
+                modalBank.textContent = details.bank;
+                modalAccountName.textContent = details.name;
+                modalAccountNumber.textContent = details.number;
+                
+                // Use generated reference if provided, otherwise use default
+                if (generatedReference) {
+                    modalReferenceNote.textContent = `Please use "${generatedReference}" as payment reference.`;
+                } else {
+                    modalReferenceNote.textContent = `Please use "${details.reference}" as payment reference.`;
+                }
+                
+                paymentModal.classList.remove('hidden');
+            }
+
+            // --- Function to close the modal ---
+            function closeModalFunction() {
+                paymentModal.classList.add('hidden');
+            }
+
+            // --- NEW: Dues Info Modal Functions ---
+            function openDuesInfoModal() {
+                duesInfoForm.reset(); // Clear form on open
+                duesInfoModal.classList.remove('hidden');
+            }
+            
+            function closeDuesInfoModalFunction() {
+                duesInfoModal.classList.add('hidden');
+            }
+
+            // --- Event Listeners ---
+            if (duesButton) {
+                // MODIFIED: Open the info modal first
+                duesButton.addEventListener('click', openDuesInfoModal);
+            }
+            if (tshirtButton) {
+                // UNCHANGED: Open payment modal directly
+                tshirtButton.addEventListener('click', () => openModal('tshirt'));
+            }
+            if (closeModal) {
+                closeModal.addEventListener('click', closeModalFunction);
+            }
+
+            // Close modal by clicking backdrop
+            if (paymentModal) {
+                paymentModal.addEventListener('click', (e) => {
+                    if (e.target === paymentModal) {
+                        closeModalFunction();
+                    }
+                });
+            }
+
+            // --- NEW: Dues Info Modal Listeners ---
+            if (closeDuesInfoModal) {
+                closeDuesInfoModal.addEventListener('click', closeDuesInfoModalFunction);
+            }
+            
+            if (duesInfoModal) {
+                duesInfoModal.addEventListener('click', (e) => {
+                    if (e.target === duesInfoModal) {
+                        closeDuesInfoModalFunction();
+                    }
+                });
+            }
+
+            if (duesInfoForm) {
+                duesInfoForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const fullName = fullNameInput.value.trim();
+                    const matricNo = matricNoInput.value.trim();
+                    const department = departmentSelect.value;
+                    
+                    if (!fullName || !matricNo || !department) {
+                        // Using the showSimpleMessage from the script
+                        showSimpleMessage("Please fill out all fields.", true);
+                        return;
+                    }
+
+                    // Get the acronym from the value
+                    const departmentAcronym = department;
+                    
+                    // Create the payment reference
+                    const paymentReference = `${fullName} - ${matricNo} - ${departmentAcronym}`;
+
+                    // Close info modal and open payment modal
+                    closeDuesInfoModalFunction();
+                    openModal('dues', paymentReference);
+                });
+            }
+
+            // --- Copy to Clipboard Function ---
+            if (copyButton) {
+                copyButton.addEventListener('click', () => {
+                    const accountNumber = modalAccountNumber.textContent;
+                    try {
+                        // Use execCommand as navigator.clipboard might be blocked in iframe
+                        const textArea = document.createElement('textarea');
+                        textArea.value = accountNumber;
+                        textArea.style.position = 'absolute';
+                        textArea.style.left = '-9999px';
+                        document.body.appendChild(textArea);
+                        textArea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textArea);
+                        
+                        showSimpleMessage("Account number copied!");
+
+                    } catch (err) {
+                        console.error('Failed to copy text: ', err);
+                        showSimpleMessage("Failed to copy. Please copy manually.", true);
+                    }
+                });
+            }
+        });
+    </script>
+
+</body>
+</html>
