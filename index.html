@@ -19,8 +19,17 @@
             body * {
                 visibility: hidden;
             }
-            #receiptPreviewModal, #receiptPreviewModal * {
+            #receiptPreviewModal, #receiptPreviewModal *, #adminPanel, #adminPanel * {
                 visibility: visible;
+            }
+            #adminPanel {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                margin: 0;
+                box-shadow: none;
+                border: none;
             }
             #receiptPreviewModal {
                 position: absolute;
@@ -38,7 +47,7 @@
                  box-shadow: none;
                  border: none;
             }
-            #receiptModalHeader {
+            #receiptModalHeader, #adminHeader, #adminControls, #header, #paymentOptions, #paymentHistory {
                 display: none;
             }
         }
@@ -64,26 +73,32 @@
     <script type="module">
         // Import Firebase modules
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged, setPersistence, inMemoryPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, addDoc, collection, onSnapshot, query, getDoc, setLogLevel, serverTimestamp, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, setPersistence, inMemoryPersistence, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, collection, onSnapshot, query, getDoc, setLogLevel, serverTimestamp, updateDoc, collectionGroup, where, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Global Variables ---
         let db, auth;
         let userId = null;
-        // This is your app's unique ID for the database. You can leave this as-is.
         const appId = 'nuesa-payment-hub';
-        let unsubscribePayments = null; // To store the onSnapshot unsubscribe function
-        let currentPaymentIdToConfirm = null; // Store ID for confirmation modal
+        let unsubscribePayments = null; 
+        let currentPaymentIdToConfirm = null; 
+        let currentAdminUser = null; // Store admin user info
 
-        // --- TODO: UPDATE FOR LIVE SITE (1/3) ---
-        // Update these payment amounts with your real values.
+        // --- TODO: UPDATE FOR LIVE SITE (1/4) ---
+        // Add the Google emails of all admins who should have access
+        const ADMIN_EMAILS = [
+            "your-email@gmail.com",
+            "another-admin@nuesa.com"
+        ];
+        // ------------------------------------------
+
+        // --- TODO: UPDATE FOR LIVE SITE (2/4) ---
         const PAYMENT_AMOUNTS = {
-            dues: 3000,    // <-- Change this
-            tshirt: 5000   // <-- Change this
+            dues: 6000,
+            tshirt: 7000
         };
 
-        // --- TODO: UPDATE FOR LIVE SITE (2/3) ---
-        // Update these bank account details with your real information.
+        // --- TODO: UPDATE FOR LIVE SITE (3/4) ---
         const accountDetails = {
             dues: {
                 title: "NUESA Dues Payment",
@@ -99,14 +114,8 @@
             }
         };
 
-        // --- TODO: UPDATE FOR LIVE SITE (3/3) ---
+        // --- TODO: UPDATE FOR LIVE SITE (4/4) ---
         // PASTE YOUR FIREBASE CONFIGURATION HERE
-        // 1. Go to your Firebase project console.
-        // 2. Click the Gear icon > Project Settings.
-        // 3. Scroll down to "Your apps".
-        // 4. Click on the "</>" icon to see your "Web app" config.
-        // 5. Copy the config object and paste it below.
-        // ------------------------------------------------
         const firebaseConfig = {
             apiKey: "PASTE_YOUR_API_KEY_HERE",
             authDomain: "PASTE_YOUR_AUTH_DOMAIN_HERE",
@@ -124,6 +133,8 @@
         const messageClose = document.getElementById('messageClose');
         const authStatus = document.getElementById('authStatus');
         const userIdDisplay = document.getElementById('userIdDisplay');
+        const adminLoginButton = document.getElementById('adminLoginButton');
+        const mainContent = document.getElementById('mainContent');
 
         // Payment Portal Elements
         const duesButton = document.getElementById('duesButton');
@@ -164,6 +175,14 @@
         const closeReceiptModal = document.getElementById('closeReceiptModal');
         const printButton = document.getElementById('printButton');
         const receiptPreview = document.getElementById('receiptPreview');
+
+        // Admin Panel Elements
+        const adminPanel = document.getElementById('adminPanel');
+        const adminWelcome = document.getElementById('adminWelcome');
+        const adminDeptFilter = document.getElementById('adminDeptFilter');
+        const adminPaymentsList = document.getElementById('adminPaymentsList');
+        const adminLoading = document.getElementById('adminLoading');
+        const adminPrintList = document.getElementById('adminPrintList');
 
 
         // --- Helper Functions ---
@@ -222,7 +241,6 @@
 
         async function initFirebase() {
             try {
-                // Check if Firebase config is placeholder
                 if (firebaseConfig.apiKey === "PASTE_YOUR_API_KEY_HERE") {
                     console.error("Firebase config is missing.");
                     showMessage("Application is not configured.", true);
@@ -230,43 +248,41 @@
                     authStatus.classList.add('bg-red-500');
                     return;
                 }
-
                 showLoading(true);
-                
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
                 setLogLevel('debug'); 
-
                 await setPersistence(auth, inMemoryPersistence);
 
                 onAuthStateChanged(auth, async (user) => {
-                    if (user) {
+                    if (user && !user.isAnonymous) {
+                        // This is a Google Admin user
+                        currentAdminUser = user;
+                        checkAdminStatus(user);
+                    }
+                    else if (user && user.isAnonymous) {
+                        // This is a student/public user
                         userId = user.uid;
                         authStatus.textContent = 'Authenticated';
                         authStatus.classList.replace('bg-yellow-500', 'bg-green-500');
-                        userIdDisplay.textContent = `User ID: ${userId.substring(0, 8)}...`; // Shorten for display
-                        
-                        // Load user's payment history
+                        userIdDisplay.textContent = `User ID: ${userId.substring(0, 8)}...`;
                         loadPaymentHistory(userId);
                     } else {
+                        // No user, sign in anonymously for the student flow
                         userId = null;
                         authStatus.textContent = 'Authenticating...';
                         authStatus.classList.replace('bg-green-500', 'bg-yellow-500');
                         userIdDisplay.textContent = 'User ID: N/A';
                         
-                        if (unsubscribePayments) {
-                            unsubscribePayments();
-                            unsubscribePayments = null;
-                        }
+                        if (unsubscribePayments) unsubscribePayments();
                         renderPendingPayments([]);
                         renderCompletedReceipts([]);
 
                         try {
-                            // Only use Anonymous sign-in for live site
                             await signInAnonymously(auth);
                         } catch (error) {
-                            console.error("Authentication Error:", error);
+                            console.error("Anonymous Auth Error:", error);
                             authStatus.textContent = 'Auth Failed';
                             authStatus.classList.add('bg-red-500');
                             showMessage("Failed to authenticate.", true);
@@ -285,16 +301,14 @@
         }
 
         /**
-         * Loads and listens for payment history
+         * Loads and listens for a single student's payment history
          */
         function loadPaymentHistory(uid) {
-            if (unsubscribePayments) {
-                unsubscribePayments(); 
-            }
+            if (unsubscribePayments) unsubscribePayments(); 
 
             const paymentsPath = `artifacts/${appId}/users/${uid}/payments`;
             const paymentsCol = collection(db, paymentsPath);
-            const q = query(paymentsCol); // Add orderBy('createdAt', 'desc') if you create an index
+            const q = query(paymentsCol); 
 
             unsubscribePayments = onSnapshot(q, (snapshot) => {
                 const pending = [];
@@ -308,7 +322,6 @@
                     }
                 });
                 
-                // Sort by date, newest first
                 pending.sort((a, b) => b.createdAt?.toMillis() - a.createdAt?.toMillis());
                 completed.sort((a, b) => b.createdAt?.toMillis() - a.createdAt?.toMillis());
 
@@ -320,22 +333,17 @@
             });
         }
 
-        /**
-         * Renders the list of pending payments
-         */
         function renderPendingPayments(payments) {
             pendingPaymentsList.innerHTML = '';
             if (payments.length === 0) {
                 pendingPaymentsList.innerHTML = `<li class="text-gray-500 text-center col-span-full">No pending payments.</li>`;
                 return;
             }
-
             payments.forEach(payment => {
                 const li = document.createElement('li');
                 li.className = 'bg-white p-4 rounded-lg shadow border border-yellow-300';
                 li.innerHTML = `
                     <div class="flex items-center space-x-3">
-                        <!-- Logo -->
                         <img src="NUESA.jpg" onerror="this.src='https://placehold.co/40x40/3B82F6/FFFFFF?text=N'" class="rounded-full w-10 h-10 object-cover" alt="NUESA Logo">
                         <div>
                             <p class="font-semibold text-lg text-gray-800">${payment.paymentType === 'dues' ? 'NUESA Dues' : 'NUESA T-Shirt'}</p>
@@ -354,16 +362,12 @@
             });
         }
 
-        /**
-         * Renders the list of completed receipts
-         */
         function renderCompletedReceipts(receipts) {
             completedReceiptsList.innerHTML = '';
             if (receipts.length === 0) {
                 completedReceiptsList.innerHTML = `<li class="text-gray-500 text-center col-span-full">No completed receipts.</li>`;
                 return;
             }
-
             receipts.forEach(receipt => {
                 const li = document.createElement('li');
                 li.className = 'bg-white p-4 rounded-lg shadow hover:shadow-md transition-shadow cursor-pointer border border-green-300';
@@ -371,7 +375,6 @@
                 li.innerHTML = `
                     <div class="flex justify-between items-center">
                         <div class="flex items-center space-x-3">
-                            <!-- Logo -->
                             <img src="NUESA.jpg" onerror="this.src='https://placehold.co/40x40/3B82F6/FFFFFF?text=N'" class="rounded-full w-10 h-10 object-cover" alt="NUESA Logo">
                             <div>
                                 <p class="font-semibold text-blue-600">${receipt.paymentType === 'dues' ? 'NUESA Dues' : 'NUESA T-Shirt'}</p>
@@ -388,9 +391,6 @@
             });
         }
         
-        /**
-         * Saves a new pending payment to Firestore
-         */
         async function savePendingPayment(paymentData) {
             if (!userId) {
                 showMessage("You must be authenticated.", true);
@@ -401,7 +401,8 @@
                 const paymentsPath = `artifacts/${appId}/users/${userId}/payments`;
                 const docRef = await addDoc(collection(db, paymentsPath), {
                     ...paymentData,
-                    createdAt: serverTimestamp() // Use server timestamp
+                    student_uid: userId, // Add student's UID for rule matching
+                    createdAt: serverTimestamp()
                 });
                 showMessage("Pending payment created!", false);
                 return docRef;
@@ -414,9 +415,6 @@
             }
         }
 
-        /**
-         * Updates a payment to 'completed'
-         */
         async function completePayment(paymentId, bankReference) {
              if (!userId || !paymentId) {
                 showMessage("Error: Not authenticated or no payment ID.", true);
@@ -440,9 +438,6 @@
             }
         }
 
-        /**
-         * Fetches and displays a single receipt
-         */
         async function viewPaymentReceipt(paymentId) {
             if (!userId) {
                 showMessage("You must be authenticated to view receipts.", true);
@@ -466,26 +461,19 @@
             showLoading(false);
         }
 
-        /**
-         * Generates and displays the HTML for a receipt preview
-         */
         function displayReceiptPreview(paymentData) {
             const paymentTitle = paymentData.paymentType === 'dues' ? 'NUESA Dues' : 'NUESA T-Shirt';
             
             receiptPreview.innerHTML = `
                 <div class="p-8 md:p-12">
                     <div class="flex flex-col sm:flex-row justify-between items-start mb-8 space-y-4 sm:space-y-0">
-                        <!-- Logo and Association Name -->
                         <div class="flex items-center space-x-4">
-                            <!-- Logo -->
                             <img src="NUESA.jpg" onerror="this.src='https://placehold.co/80x80/3B82F6/FFFFFF?text=NUESA'" class="rounded-lg w-20 h-20 object-cover" alt="NUESA Logo">
                             <div>
                                 <p class="text-2xl font-bold text-gray-800">NUESA</p>
                                 <p class="text-gray-600 text-sm">Nigeria University<br>Education Students Association</p>
                             </div>
                         </div>
-    
-                        <!-- Receipt Title -->
                         <div class="text-left sm:text-right w-full sm:w-auto">
                             <h1 class="text-3xl font-bold text-gray-900">Payment Receipt</h1>
                             <p class="text-gray-500">Receipt ID: <span class="font-medium text-gray-700">${paymentData.id}</span></p>
@@ -494,28 +482,23 @@
 
                     <div class="border-y border-gray-200 py-8 my-8">
                         <div class="grid grid-cols-2 md:grid-cols-3 gap-6">
-                            <!-- Payer Info -->
                             <div>
                                 <p class="text-sm text-gray-500 uppercase tracking-wider">Paid By</p>
                                 <p class="font-semibold text-gray-800 text-lg">${paymentData.fullName || 'N/A'}</p>
                                 <p class="text-gray-600">${paymentData.matricNo || 'N/A'}</p>
                             </div>
-                            <!-- Department Info -->
                             <div>
                                 <p class="text-sm text-gray-500 uppercase tracking-wider">Department</p>
                                 <p class="font-semibold text-gray-800 text-lg">${paymentData.department || 'N/A'}</p>
                             </div>
-                            <!-- Level Info -->
                             <div>
                                 <p class="text-sm text-gray-500 uppercase tracking-wider">Level</p>
                                 <p class="font-semibold text-gray-800 text-lg">${paymentData.level || 'N/A'}</p>
                             </div>
-                            <!-- Cohort Info -->
                             <div>
                                 <p class="text-sm text-gray-500 uppercase tracking-wider">Cohort</p>
                                 <p class="font-semibold text-gray-800 text-lg">${paymentData.cohort || 'N/A'}</p>
                             </div>
-                            <!-- Date Info -->
                             <div>
                                 <p class="text-sm text-gray-500 uppercase tracking-wider">Date Paid</p>
                                 <p class="font-semibold text-gray-800 text-lg">${formatDate(paymentData.completedAt || paymentData.createdAt)}</p>
@@ -523,7 +506,6 @@
                         </div>
                     </div>
 
-                    <!-- Payment Details Table -->
                     <table class="w-full text-left mb-8">
                         <thead>
                             <tr class="border-b border-gray-300">
@@ -548,7 +530,6 @@
                         </tfoot>
                     </table>
                     
-                    <!-- Footer -->
                     <div class="text-center text-sm text-gray-500 mt-12">
                         <p>Thank you for your payment!</p>
                         <p class="mt-1">Bank Reference: ${paymentData.bankReference || 'N/A'}</p>
@@ -558,27 +539,21 @@
             openModal(receiptPreviewModal);
         }
 
-        // --- Event Handlers ---
+        // --- Event Handlers (Student Flow) ---
         
-        // Open Dues Info Modal
         duesButton.addEventListener('click', () => {
             duesInfoForm.reset();
             openModal(duesInfoModal);
         });
 
-        // Open T-Shirt Info Modal
         tshirtButton.addEventListener('click', () => {
             tshirtInfoForm.reset();
             openModal(tshirtInfoModal);
         });
 
-        // Close Dues Info Modal
         closeDuesInfoModal.addEventListener('click', () => closeModal(duesInfoModal));
-        
-        // Close T-Shirt Info Modal
         closeTshirtInfoModal.addEventListener('click', () => closeModal(tshirtInfoModal));
 
-        // Handle Dues Info Form Submission
         duesInfoForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(duesInfoForm);
@@ -593,7 +568,9 @@
                 return;
             }
 
-            const uniqueCode = `NUESA-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+            const randomPart = Math.random().toString(36).substring(2, 6).toUpperCase();
+            const uniqueCode = `DUE-${department}-${level}-${randomPart}`;
+
             const paymentData = {
                 paymentType: 'dues',
                 amount: PAYMENT_AMOUNTS.dues,
@@ -609,7 +586,6 @@
             const docRef = await savePendingPayment(paymentData);
             
             if (docRef) {
-                // Show payment details modal
                 const details = accountDetails.dues;
                 modalTitle.textContent = details.title;
                 modalBank.textContent = details.bank;
@@ -622,7 +598,6 @@
             }
         });
         
-        // Handle T-Shirt Info Form Submission
         tshirtInfoForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(tshirtInfoForm);
@@ -637,7 +612,9 @@
                 return;
             }
 
-            const uniqueCode = `TSHIRT-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+            const randomPart = Math.random().toString(36).substring(2, 6).toUpperCase();
+            const uniqueCode = `TSHIRT-${department}-${level}-${randomPart}`;
+
             const paymentData = {
                 paymentType: 'tshirt',
                 amount: PAYMENT_AMOUNTS.tshirt,
@@ -653,7 +630,6 @@
             const docRef = await savePendingPayment(paymentData);
             
             if (docRef) {
-                // Show payment details modal
                 const details = accountDetails.tshirt;
                 modalTitle.textContent = details.title;
                 modalBank.textContent = details.bank;
@@ -666,54 +642,44 @@
             }
         });
 
-        // Close Payment Details Modal
         closeModal.addEventListener('click', () => closeModal(paymentModal));
 
-        // Copy Account Number
         copyButton.addEventListener('click', () => {
             const accountNumber = modalAccountNumber.textContent;
-            
-            // Create a temporary textarea to copy text
             const tempInput = document.createElement('textarea');
             tempInput.style.position = 'absolute';
             tempInput.style.left = '-9999px';
             tempInput.value = accountNumber;
             document.body.appendChild(tempInput);
             tempInput.select();
-            
             try {
                 document.execCommand('copy');
                 showMessage('Account number copied!', false);
             } catch (err) {
                 showMessage('Failed to copy account number.', true);
-                console.error('Copy failed', err);
             } finally {
                 document.body.removeChild(tempInput);
             }
         });
 
-        // Handle clicks on "Confirm Payment" buttons (using event delegation)
         pendingPaymentsList.addEventListener('click', (e) => {
-            if (e.target.classList.contains('confirm-payment-btn')) {
-                currentPaymentIdToConfirm = e.target.getAttribute('data-id');
+            const confirmButton = e.target.closest('.confirm-payment-btn');
+            if (confirmButton) {
+                currentPaymentIdToConfirm = confirmButton.getAttribute('data-id');
                 bankReferenceInput.value = ''; // Clear input
                 openModal(confirmPaymentModal);
             }
         });
 
-        // Close Confirm Payment Modal
         closeConfirmModal.addEventListener('click', () => closeModal(confirmPaymentModal));
 
-        // Handle Confirm Payment Form Submission
         confirmPaymentForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const bankReference = bankReferenceInput.value.trim();
-            
             if (!bankReference) {
                 showMessage("Please enter your bank's transaction reference.", true);
                 return;
             }
-            
             if (currentPaymentIdToConfirm) {
                 await completePayment(currentPaymentIdToConfirm, bankReference);
                 closeModal(confirmPaymentModal);
@@ -723,32 +689,160 @@
             }
         });
 
-        // Handle clicks on completed receipts (using event delegation)
         completedReceiptsList.addEventListener('click', (e) => {
-            const receiptItem = e.target.closest('li');
-            if (receiptItem && receiptItem.hasAttribute('data-id')) {
+            const receiptItem = e.target.closest('li[data-id]');
+            if (receiptItem) {
                 const paymentId = receiptItem.getAttribute('data-id');
                 viewPaymentReceipt(paymentId);
             }
         });
         
-        // Close Receipt Preview Modal
         closeReceiptModal.addEventListener('click', () => closeModal(receiptPreviewModal));
         
-        // Print Receipt
         printButton.addEventListener('click', () => {
             window.print();
         });
+
+        // --- Admin Functions ---
+
+        adminLoginButton.addEventListener('click', () => {
+            if (currentAdminUser) {
+                // Already logged in as admin, just show panel
+                showAdminPanel(currentAdminUser);
+            } else {
+                // Not logged in, start Google Sign-In
+                doAdminLogin();
+            }
+        });
+
+        async function doAdminLogin() {
+            showLoading(true);
+            const provider = new GoogleAuthProvider();
+            try {
+                const result = await signInWithPopup(auth, provider);
+                checkAdminStatus(result.user);
+            } catch (error) {
+                console.error("Admin Sign-In Error:", error);
+                showMessage("Admin login failed. " + error.message, true);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function checkAdminStatus(user) {
+            if (user && ADMIN_EMAILS.includes(user.email)) {
+                // User is an admin
+                currentAdminUser = user;
+                showAdminPanel(user);
+            } else {
+                // User is not an admin
+                showMessage("You are not authorized as an admin.", true);
+                auth.signOut(); // Sign out non-admin
+            }
+        }
+        
+        function showAdminPanel(user) {
+            mainContent.classList.add('hidden'); // Hide student view
+            adminPanel.classList.remove('hidden'); // Show admin panel
+            adminWelcome.textContent = `Welcome, Admin (${user.displayName || user.email})`;
+            loadAdminPayments(); // Load all payments
+        }
+
+        adminDeptFilter.addEventListener('change', () => {
+            loadAdminPayments();
+        });
+
+        adminPrintList.addEventListener('click', () => {
+            window.print();
+        });
+
+        async function loadAdminPayments() {
+            adminLoading.classList.remove('hidden');
+            adminPaymentsList.innerHTML = '';
+            
+            try {
+                // This is a collection group query. It searches ALL 'payments' collections.
+                // This requires a Firestore Rule to allow.
+                const paymentsRef = collectionGroup(db, 'payments');
+                
+                const selectedDept = adminDeptFilter.value;
+                let q;
+
+                // Base query for all completed payments
+                const baseQuery = [where('status', '==', 'completed')];
+                
+                // Add department filter if one is selected
+                if (selectedDept) {
+                    baseQuery.push(where('department', '==', selectedDept));
+                }
+
+                q = query(paymentsRef, ...baseQuery);
+
+                const querySnapshot = await getDocs(q);
+                
+                if (querySnapshot.empty) {
+                    adminPaymentsList.innerHTML = '<tr><td colspan="7" class="text-center p-4">No completed payments found.</td></tr>';
+                    adminLoading.classList.add('hidden');
+                    return;
+                }
+                
+                let count = 1;
+                let totalAmount = 0;
+                querySnapshot.forEach(doc => {
+                    const payment = doc.data();
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b border-gray-200';
+                    tr.innerHTML = `
+                        <td class="p-3">${count++}</td>
+                        <td class="p-3">${payment.fullName}</td>
+                        <td class="p-3">${payment.matricNo}</td>
+                        <td class="p-3">${payment.department}</td>
+                        <td class="p-3">${payment.paymentType === 'dues' ? 'Dues' : 'T-Shirt'}</td>
+                        <td class="p-3">${formatDate(payment.completedAt)}</td>
+                        <td class="p-3 text-right">${formatCurrency(payment.amount)}</td>
+                    `;
+                    adminPaymentsList.appendChild(tr);
+                    totalAmount += payment.amount;
+                });
+
+                // Add Total row
+                const totalRow = document.createElement('tr');
+                totalRow.className = 'font-bold bg-gray-100';
+                totalRow.innerHTML = `
+                    <td colspan="6" class="p-3 text-right">TOTAL:</td>
+                    <td class="p-3 text-right">${formatCurrency(totalAmount)}</td>
+                `;
+                adminPaymentsList.appendChild(totalRow);
+
+            } catch (error) {
+                console.error("Error loading admin payments:", error);
+                showMessage("Failed to load payments. " + error.message, true);
+                adminPaymentsList.innerHTML = `<tr><td colspan="7" class="text-center p-4 text-red-500">Error: ${error.message}. <br>Did you update your Firestore rules?</td></tr>`;
+            } finally {
+                adminLoading.classList.add('hidden');
+            }
+        }
+
 
         // --- Initialize the Application ---
         document.addEventListener('DOMContentLoaded', initFirebase);
 
     </script>
 
-    <!-- Main Payment Portal UI -->
-    <div class="w-full max-w-4xl mx-auto">
-        <header class="text-center mb-8">
-            <div class="flex flex-col sm:flex-row items-center justify-center sm:space-x-6 space-y-4 sm:space-y-0">
+    <!-- Main Student Payment Portal UI -->
+    <div id="mainContent" class="w-full max-w-4xl mx-auto">
+        <header id="header" class="mb-8">
+            <div class="flex justify-between items-center mb-8">
+                <div class="text-xs">
+                    <span id="authStatus" class="px-2 py-1 text-white rounded-full bg-yellow-500 text-xs">Connecting...</span>
+                    <span id="userIdDisplay" class="ml-2 text-gray-500 hidden sm:inline">User ID: N/A</span>
+                </div>
+                <button id="adminLoginButton" class="text-sm text-blue-600 hover:text-blue-800 font-medium">
+                    Admin Login
+                </button>
+            </div>
+            
+            <div class="flex flex-col sm:flex-row items-center justify-center sm:space-x-6 space-y-4 sm:space-y-0 text-center">
                 <!-- Logo -->
                 <img src="NUESA.jpg" onerror="this.src='https://placehold.co/100x100/3B82F6/FFFFFF?text=NUESA'" alt="NUESA Logo" class="rounded-full shadow-md w-24 h-24 object-cover">
                 <div class="text-center sm:text-left">
@@ -756,10 +850,6 @@
                     <p class="text-xl font-semibold text-gray-700 mt-1">NIGERIA UNIVERSITY EDUCATION STUDENTS ASSOCIATION</p>
                     <p class="text-lg text-gray-600 mt-2">Payment Portal</p>
                 </div>
-            </div>
-            <div class="mt-6 text-xs inline-block">
-                <span id="authStatus" class="px-2 py-1 text-white rounded-full bg-yellow-500 text-xs">Connecting...</span>
-                <span id="userIdDisplay" class="ml-2 text-gray-500">User ID: N/A</span>
             </div>
         </header>
 
@@ -769,7 +859,7 @@
         </div>
         
         <!-- Payment Options -->
-        <section class="bg-white p-6 rounded-lg shadow mb-8">
+        <section id="paymentOptions" class="bg-white p-6 rounded-lg shadow mb-8">
             <h2 class="text-2xl font-bold text-gray-800 mb-4">Make a New Payment</h2>
             <p class="text-gray-600 mb-6">Select the payment you want to make.</p>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -785,14 +875,13 @@
         </section>
 
         <!-- Payment History -->
-        <section>
+        <section id="paymentHistory">
             <h2 class="text-2xl font-bold text-gray-800 mb-4">My Payment History</h2>
             
             <!-- Pending Payments -->
             <div class="mb-8">
                 <h3 class="text-xl font-semibold text-yellow-700 mb-3">Pending Payments</h3>
                 <ul id="pendingPaymentsList" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <!-- Pending payments will be injected here -->
                     <li class="text-gray-500 text-center col-span-full">Loading pending payments...</li>
                 </ul>
             </div>
@@ -801,14 +890,63 @@
             <div>
                 <h3 class="text-xl font-semibold text-green-700 mb-3">Completed Receipts</h3>
                 <ul id="completedReceiptsList" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <!-- Completed receipts will be injected here -->
                      <li class="text-gray-500 text-center col-span-full">Loading completed receipts...</li>
                 </ul>
             </div>
         </section>
     </div>
 
+    <!-- NEW: Admin Panel UI (Hidden by default) -->
+    <section id="adminPanel" class="hidden w-full max-w-6xl mx-auto bg-white p-6 rounded-lg shadow-lg">
+        <div id="adminHeader" class="flex flex-col sm:flex-row justify-between items-center mb-6">
+            <div>
+                <h2 class="text-3xl font-bold text-gray-800">Admin Payment Dashboard</h2>
+                <p id="adminWelcome" class="text-gray-600">Welcome, Admin</p>
+            </div>
+            <button id="adminPrintList" class="mt-4 sm:mt-0 bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors">
+                Print List
+            </button>
+        </div>
+
+        <div id="adminControls" class="mb-4">
+            <label for="adminDeptFilter" class="block text-sm font-medium text-gray-700">Filter by Department:</label>
+            <select id="adminDeptFilter" name="department" class="mt-1 w-full max-w-xs border border-gray-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">All Departments</option>
+                <option value="ULSESA">SCIENCE EDUCATION (ULSESA)</option>
+                <option value="TVESA">TECHNOLOGY AND VOCATIONAL EDUCATION (TVESA)</option>
+                <option value="HKHE">HUMAN KINETICS AND HEALTH EDUCATION (HKHE)</option>
+                <option value="SESSA">SOCIAL SCIENCES EDUCATION (SESSA)</option>
+                <option value="EMSA">EDUCATIONAL MANAGEMENT (EMSA)</option>
+                <option value="EFSA">EDUCATIONAL FOUNDATION (EFSA)</option>
+                <option value="AESA">ART EDUCATION (AESA)</option>
+                <option value="NAAES">ADULT EDUCATION (NAAES)</option>
+            </select>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="w-full min-w-[700px]">
+                <thead class="bg-gray-50 border-b border-gray-200">
+                    <tr>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">#</th>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">Full Name</th>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">Matric No.</th>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">Department</th>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">Type</th>
+                        <th class="p-3 text-left text-sm font-semibold text-gray-600 uppercase">Date Paid</th>
+                        <th class="p-3 text-right text-sm font-semibold text-gray-600 uppercase">Amount</th>
+                    </tr>
+                </thead>
+                <tbody id="adminPaymentsList" class="divide-y divide-gray-200">
+                    <!-- Admin data will be injected here -->
+                </tbody>
+            </table>
+            <div id="adminLoading" class="hidden text-center p-4">Loading payment data...</div>
+        </div>
+    </section>
+
+
     <!-- Modals -->
+    <!-- (All student modals are still here, just not shown for brevity) -->
 
     <!-- Dues Info Modal -->
     <div id="duesInfoModal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 p-4">
@@ -838,7 +976,7 @@
                             <option value="EMSA">EDUCATIONAL MANAGEMENT (EMSA)</option>
                             <option value="EFSA">EDUCATIONAL FOUNDATION (EFSA)</option>
                             <option value="AESA">ART EDUCATION (AESA)</option>
-                            <option value_="">ADULT EDUCATION (NAAES)</option>
+                            <option value="NAAES">ADULT EDUCATION (NAAES)</option>
                         </select>
                     </div>
                     <div>
@@ -973,7 +1111,6 @@
     <!-- Receipt Preview Modal -->
     <div id="receiptPreviewModal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-40 p-4">
         <div class="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
-            <!-- Modal Header -->
             <div id="receiptModalHeader" class="flex justify-between items-center p-4 border-b border-gray-200">
                 <h3 class="text-xl font-bold text-gray-800">Payment Receipt</h3>
                 <div>
@@ -983,7 +1120,6 @@
                     <button id="closeReceiptModal" class="text-gray-500 hover:text-gray-800 text-2xl">&times;</button>
                 </div>
             </div>
-            <!-- Receipt Content (Scrollable) -->
             <div id="receiptPreviewContent" class="overflow-y-auto">
                 <div id="receiptPreview" class="bg-white">
                     <!-- Receipt content will be injected here -->
